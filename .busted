@@ -1,0 +1,12 @@
+-- busted configuration.
+-- Run the tests from this folder with: busted
+-- Without a Lua interpreter with busted, use: lua spec/run.lua
+return {
+    _all = {
+        lpath = "./?.lua;./?/init.lua",
+    },
+    default = {
+        ROOT = { "spec" },
+        pattern = "_spec%.lua$",
+    },
+}
