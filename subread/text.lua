@@ -143,6 +143,20 @@ function Text.anchors(s, lengths)
     return out
 end
 
+-- Length, in characters, of the tail that finds the end of a cue.
+Text.TAIL_LENGTH = 12
+
+--- Returns the last characters of a cue text, to find its end in the book.
+-- Returns nil when the text is not longer than the tail: the anchor then
+-- already covers the whole cue.
+function Text.tail(s, length)
+    length = length or Text.TAIL_LENGTH
+    local norm = Text.normalize(s)
+    local count = Text.len(norm)
+    if count <= length then return nil end
+    return Text.sub(norm, count - length + 1, count)
+end
+
 --- Cuts a string to a maximum number of characters, for a dialog title.
 function Text.ellipsize(s, max_chars)
     local norm = Text.normalize(s)

@@ -67,6 +67,16 @@ describe("SubRead text", function()
         end
     end)
 
+    it("gives the tail of a long cue and nil for a short one", function()
+        assert.is_nil(Text.tail("short cue"))
+        assert.is_nil(Text.tail("exactly12chr"))
+        assert.equals("brown fox jump", Text.tail("The quick  brown fox jump", 14))
+        local cue = "とりあえず書いてしまってから、その作品が向いてそうな雑誌なり出版社に持ち込む。"
+        local tail = Text.tail(cue)
+        assert.equals(12, Text.len(tail))
+        assert.equals("誌なり出版社に持ち込む。", tail)
+    end)
+
     it("ellipsizes long text only", function()
         assert.equals("short", Text.ellipsize("short", 10))
         assert.equals("abcde\226\128\166", Text.ellipsize("abcdefgh", 5))

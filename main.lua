@@ -8,11 +8,16 @@ with the audio player and keeps the place of the narration on the screen.
 Only crengine documents (EPUB, FB2, TXT, HTML) are supported. PDF and DjVu
 have no xpointer, so the place cannot be followed.
 
+On Android the plugin reads the audio player through SubRead Overlay, an app
+with notification access. See subread/android_player.lua.
+
 @module koplugin.SubRead
 --]]--
 
 local ButtonDialog = require("ui/widget/buttondialog")
 local DateTimeWidget = require("ui/widget/datetimewidget")
+local Device = require("device")
+local DictQuickLookup = require("ui/widget/dictquicklookup")
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local Notification = require("ui/widget/notification")
@@ -29,6 +34,7 @@ local T = require("ffi/util").template
 
 local Clock = require("subread.clock")
 local Cues = require("subread.cues")
+local PlayerState = require("subread.player_state")
 local Srt = require("subread.srt")
 local Text = require("subread.text")
 
@@ -60,6 +66,20 @@ local MIN_SLEEP = 0.05
 -- book to its end, so this limits the cost when the book misses a stretch.
 local MISS_BACKOFF_MAX = 16
 
+-- Seconds between two reads of the audio player. The player reports its
+-- position and speed, so the clock is exact between two reads. A read only
+-- has to notice a pause, a seek or a new speed.
+local PLAYER_POLL = 2
+-- Seconds between two reads while no player has a media session.
+local PLAYER_POLL_IDLE = 5
+-- A player position this many seconds away from the clock is a seek.
+local PLAYER_JUMP = 3
+-- Seconds between two checks for the end of a dictionary lookup.
+local LOOKUP_POLL = 0.5
+-- The lookup window can open late. Give up the wait for it after this many
+-- checks and start the player again.
+local LOOKUP_WAIT_MAX = 20
+
 -- Characters of cue text shown in a dialog title.
 local TITLE_CHARS = 60
 -- Characters kept from a selection when the user syncs by selecting text.
@@ -71,6 +91,8 @@ local SETTING_FILE = "subread_srt_file"
 local SETTING_POSITION = "subread_position"
 local SETTING_SPEED = "subread_speed"
 local SETTING_OFFSET = "subread_offset"
+-- Global setting: follow the audio player through SubRead Overlay.
+local SETTING_FOLLOW_PLAYER = "subread_follow_player"
 
 local SubRead = WidgetContainer:extend{
     name = "subread",
@@ -90,16 +112,58 @@ function SubRead:init()
     self.scheduled = false
     self.tick_task = function() self:_tick() end
 
+    -- The bridge to the audio player. Only Android has one.
+    self.player = nil
+    if Device:isAndroid() then
+        local ok, module = pcall(require, "subread.android_player")
+        if ok then
+            self.player = module
+        else
+            logger.warn("SubRead: no player bridge:", module)
+        end
+    end
+    self.player_on = false      -- true while the follow reads the player
+    self.player_status = nil    -- "no_player" while the player has no media session
+    self.lookup_paused = false  -- true while the player waits for a dictionary lookup
+    self.lookup_external = false
+    self.lookup_seen = false
+    self.lookup_waited = 0
+    self.lookup_task = function() self:_checkLookupDone() end
+    self.skip_player_read = false
+
+    self.mark = nil             -- { start xpointer, end xpointer } of the cue on screen
+
+    self:placeInToolsMenu()
     self.ui.menu:registerToMainMenu(self)
     if self:isSupported() then
         self:registerDispatcherActions()
         self:addToHighlightDialog()
+        -- ReaderView calls paintTo of each view module after the page
+        -- (readerview.lua:257). The mark is drawn there.
+        self.view:registerViewModule("subread", self)
     end
 end
 
 function SubRead:isSupported()
     -- self.ui.rolling exists only for crengine documents (readerui.lua:382).
     return self.ui.rolling ~= nil
+end
+
+--- True when the user wants the follow to read the audio player.
+function SubRead:followsPlayer()
+    return self.player ~= nil and G_reader_settings:nilOrTrue(SETTING_FOLLOW_PLAYER)
+end
+
+--- Puts the menu entry first in the Tools menu, so it is on the first page.
+-- ReaderMenu sorts the entries with the cached order module
+-- (readermenu.lua:350). An id that is not in the order goes to the end of
+-- the menu, which is the second page.
+function SubRead:placeInToolsMenu()
+    local ok, order = pcall(require, "ui/elements/reader_menu_order")
+    if ok and type(order) == "table" and type(order.tools) == "table"
+        and not util.arrayContains(order.tools, "subread") then
+        table.insert(order.tools, 1, "subread")
+    end
 end
 
 function SubRead:registerDispatcherActions()
@@ -164,6 +228,7 @@ end
 
 function SubRead:onCloseWidget()
     self:_unschedule()
+    self:_endLookupWait()
     self.tick_task = nil
 end
 
@@ -255,17 +320,102 @@ function SubRead:_now()
     return time.to_number(UIManager:getElapsedTimeSinceBoot())
 end
 
+--[[-- The audio player ]]--
+
+--- Reads the state of the audio player through SubRead Overlay.
+-- @return the state table of PlayerState.parse, or nil and an error name:
+--   "not_installed", "no_notification_access" or "no_player".
+function SubRead:_readPlayer()
+    local line = self.player.query()
+    if not line then return nil, "not_installed" end
+    return PlayerState.parse(line)
+end
+
+--- Sets the clock from the audio player.
+-- Returns true when the follow can go on with the player. Returns false when
+-- the player cannot be reached at all; the follow then runs its own clock.
+function SubRead:_syncClockToPlayer(now)
+    local state, err = self:_readPlayer()
+    if not state then
+        if err == "no_player" then
+            -- The player app is closed, or it has no session yet. Keep the
+            -- place and read again later.
+            self.player_status = err
+            self.clock:pause(now)
+            return true
+        end
+        self.player_on = false
+        self.player_status = nil
+        self:showMessage(self:playerProblemText(err))
+        return false
+    end
+    self.player_status = nil
+    if state.position then
+        -- A seek in the player app can go backward. The normal search runs
+        -- forward from the current page, so treat a jump like a seek that
+        -- the user asked for here.
+        local jumped = math.abs(state.position - self.clock:getPosition(now)) > PLAYER_JUMP
+        self.clock:setSpeed(state.speed, now)
+        self.clock:seek(state.position, now)
+        if jumped then self:_manualSeek() end
+    end
+    if state.playing then
+        self.clock:start(now)
+    else
+        self.clock:pause(now)
+    end
+    return true
+end
+
+function SubRead:playerProblemText(err)
+    if err == "no_notification_access" then
+        return _("SubRead Overlay has no notification access, so the audio player cannot be read. Give it the access in its app. Until then the plugin runs its own clock.")
+    end
+    return _("SubRead Overlay was not found. Install it and give it notification access, so the plugin can follow the audio player. Until then the plugin runs its own clock.")
+end
+
+--- Sends play or pause to the player when the follow reads it.
+function SubRead:_playerCall(method)
+    if not self.player_on then return end
+    self.player.call(method)
+    self.skip_player_read = true
+end
+
+--- Moves the clock, and the player when the follow reads it.
+-- The player takes a moment for a seek or a play. The read that comes at
+-- once after would bring the old state back, so that one read is skipped.
+function SubRead:_seekTo(position, now)
+    self.clock:seek(position, now)
+    if self.player_on then
+        self.player.call("seek", PlayerState.seekArgument(self.clock:getPosition(now)))
+        self.skip_player_read = true
+    end
+end
+
+--[[-- Start, pause and stop ]]--
+
 function SubRead:start()
     if not self:checkSupported() then return end
     if not self:loadSubtitles() then return end
     local now = self:_now()
-    if self.clock:getPosition(now) <= 0 then
-        local index = self:cueIndexForCurrentPage()
-        if index then
-            self.clock:seekCueTime(self.cues:get(index).start, now)
+    if self:followsPlayer() then
+        self.player_on = true
+        if self:_syncClockToPlayer(now) then
+            self:_playerCall("play")
         end
     end
-    self.clock:start(now)
+    if not self.player_on then
+        if self.clock:getPosition(now) <= 0 then
+            local index = self:cueIndexForCurrentPage()
+            if index then
+                self.clock:seekCueTime(self.cues:get(index).start, now)
+            end
+        end
+    end
+    -- The player takes a moment to start. The next read confirms the state.
+    if self.player_status ~= "no_player" then
+        self.clock:start(now)
+    end
     -- The reader may have moved the view since the last pause, so drop the
     -- lower limit and let the search start at the page that is shown.
     self.last_xpointer = nil
@@ -276,8 +426,15 @@ function SubRead:start()
 end
 
 function SubRead:pause()
-    self.clock:pause(self:_now())
-    self:_unschedule()
+    local now = self:_now()
+    self.clock:pause(now)
+    self:_playerCall("pause")
+    if self.player_on then
+        -- Keep the reads, so a start from the player app is seen.
+        self:_schedule(now, self.clock:getCueTime(now))
+    else
+        self:_unschedule()
+    end
     self:saveState()
 end
 
@@ -285,11 +442,20 @@ function SubRead:stop()
     if self.clock:isRunning() then
         self.clock:pause(self:_now())
     end
+    self:_endLookupWait()
+    self.player_on = false
+    self.player_status = nil
     self:_unschedule()
-    if self:isSupported() and self.ui.document then
-        self.ui.document:clearSelection()
+    if self.mark then
+        self.mark = nil
+        UIManager:setDirty(self.view.dialog, "ui")
     end
     self:saveState()
+end
+
+--- True when the follow runs: the clock, or the reads of the player.
+function SubRead:isActive()
+    return self.clock:isRunning() or self.player_on
 end
 
 function SubRead:toggle()
@@ -314,7 +480,7 @@ end
 --- Moves the clock and shows the new place at once.
 function SubRead:seekAndShow(position)
     local now = self:_now()
-    self.clock:seek(position, now)
+    self:_seekTo(position, now)
     self:_manualSeek()
     self:_tick()
 end
@@ -327,7 +493,7 @@ function SubRead:skipCues(count)
     index = index + count
     if index < 1 then index = 1 end
     if index > self.cues:count() then index = self.cues:count() end
-    self.clock:seekCueTime(self.cues:get(index).start, now)
+    self:_seekTo(self.cues:get(index).start + self.clock.offset, now)
     self:_manualSeek()
     self:_tick()
 end
@@ -347,6 +513,10 @@ function SubRead:_tick()
     self.scheduled = false
     if not self.cues then return end
     local now = self:_now()
+    if self.player_on and not self.skip_player_read then
+        self:_syncClockToPlayer(now)
+    end
+    self.skip_player_read = false
     local cue_time = self.clock:getCueTime(now)
     local index = self.cues:findByTime(cue_time)
     if index and index ~= self.current_index then
@@ -356,11 +526,16 @@ function SubRead:_tick()
     self:_schedule(now, cue_time)
 end
 
---- Sleeps until the next cue starts, or MAX_SLEEP, whichever is first.
+--- Sleeps until the next cue starts, or the next read of the player, or
+--- MAX_SLEEP, whichever is first.
 function SubRead:_schedule(now, cue_time)
     self:_unschedule()
-    if not self.clock:isRunning() then return end
     local delay = MAX_SLEEP
+    if self.player_on then
+        delay = self.player_status == "no_player" and PLAYER_POLL_IDLE or PLAYER_POLL
+    elseif not self.clock:isRunning() then
+        return
+    end
     local next_index = self.cues:nextAfter(cue_time)
     if next_index then
         local wait = self.clock:realSecondsUntilCueTime(self.cues:get(next_index).start, now)
@@ -426,13 +601,48 @@ function SubRead:_locate(index)
         if hits then
             for _, hit in ipairs(hits) do
                 if hit.start and self:_isAtOrAfter(floor, hit.start) then
-                    self.located[index] = { hit.start, hit["end"] }
-                    return hit.start, hit["end"]
+                    local pos1 = hit["end"]
+                    if Text.len(anchor) < Text.len(cue.norm) then
+                        pos1 = self:_cueEnd(cue, hit.start, pos1)
+                    end
+                    self.located[index] = { hit.start, pos1 }
+                    return hit.start, pos1
                 end
             end
         end
     end
     return nil
+end
+
+-- The text between the start of a cue and the end of its tail may hold ruby
+-- text, so it can be longer than the cue. A hit further away than this
+-- factor is a tail that belongs to another line.
+local CUE_END_SLACK = 2
+
+--- Finds the end of the cue text, so the mark covers the whole line.
+-- The anchor is only the first characters of the cue. The tail of the cue is
+-- searched forward from the current page, and the first hit after the start
+-- that lies close to it gives the end. When the tail is not found, the end
+-- of the anchor stays.
+function SubRead:_cueEnd(cue, pos0, anchor_end)
+    local tail = Text.tail(cue.norm)
+    if not tail then return anchor_end end
+    local document = self.ui.document
+    local hits = document:findText(tail, SEARCH_FROM_CURRENT_PAGE, SEARCH_FORWARD,
+        true, self.view.state.page, false, SEARCH_MAX_HITS, SEARCH_FLAGS)
+    if not hits then return anchor_end end
+    local limit = Text.len(cue.norm) * CUE_END_SLACK + Text.TAIL_LENGTH
+    for _, hit in ipairs(hits) do
+        if hit.start and hit["end"] and self:_isAtOrAfter(pos0, hit.start) then
+            local between = document:getTextFromXPointers(pos0, hit["end"], false)
+            if between and Text.len(Text.normalize(between)) <= limit then
+                return hit["end"]
+            end
+            -- The first hit after the start is already too far.
+            return anchor_end
+        end
+    end
+    return anchor_end
 end
 
 --- Brings the cue on screen and marks it.
@@ -459,30 +669,34 @@ function SubRead:showCue(index)
     if self.controls_dialog then self:showControls() end
 end
 
---- Turns the page if needed and draws the mark.
--- The mark is the crengine selection, the same one that KOReader draws for a
--- full text search hit (readersearch.lua:946). crengine draws it itself, so
--- it costs no extra widget, it survives a page turn, and it is never written
--- into the book's annotations.
+--- Turns the page if needed and asks for a redraw with the mark.
 function SubRead:drawCue(pos0, pos1)
     local document = self.ui.document
     local was_visible = document:isXPointerInCurrentPage(pos0)
     if not was_visible then
         self.ui.rolling:onGotoXPointer(pos0)
     end
-    if pos1 then
-        document:getTextFromXPointers(pos0, pos1, true)
-    end
+    self.mark = pos1 and { pos0, pos1 } or nil
     -- A page turn needs a partial refresh. A mark that moves inside the same
     -- page only needs the light "ui" refresh.
     UIManager:setDirty(self.view.dialog, was_visible and "ui" or "partial")
 end
 
---- Draws the cue that is on again, after something else used the selection.
-function SubRead:redrawCurrentCue()
-    if not self.current_index then return end
-    local pos0, pos1 = self:_locate(self.current_index)
-    if pos0 then self:drawCue(pos0, pos1) end
+--- Draws the mark over the page. ReaderView calls this after each paint of
+--- the page, so the mark survives a page turn and is never written into the
+--- annotations of the book. The boxes are the line segments of the cue on
+--- the screen, the same ones that ReaderHighlight draws for a highlight.
+--- crengine's own selection is not used: in vertical text it draws one line
+--- of a range only.
+function SubRead:paintTo(bb, x, y)
+    if not self.mark then return end
+    local boxes = self.ui.document:getScreenBoxesFromPositions(self.mark[1], self.mark[2], true)
+    if not boxes then return end
+    for _, box in ipairs(boxes) do
+        -- The same drawing as the "lighten" highlight style
+        -- (readerview.lua:673). The boxes are in screen coordinates.
+        bb:darkenRect(box.x, box.y, box.w, box.h, self.view.highlight.lighten_factor)
+    end
 end
 
 --[[-- Page and time ]]--
@@ -505,11 +719,7 @@ function SubRead:cueIndexForCurrentPage()
     if not self.cues then return nil end
     local page_text = self:currentPageText()
     if not page_text or page_text == "" then return nil end
-    local index = self.cues:findIndexForText(page_text)
-    -- getTextFromXPointers with draw_selection false can drop the mark, so
-    -- put it back.
-    if self.clock:isRunning() then self:redrawCurrentCue() end
-    return index
+    return self.cues:findIndexForText(page_text)
 end
 
 function SubRead:showPageTime()
@@ -538,16 +748,98 @@ function SubRead:syncToPage()
     self:syncToCue(index)
 end
 
---- Sets the clock to the start of a cue.
+--- Sets the clock to the start of a cue. When the follow reads the player,
+--- the audio moves there too.
 function SubRead:syncToCue(index)
     local cue = self.cues:get(index)
     if not cue then return end
     local now = self:_now()
-    self.clock:seekCueTime(cue.start, now)
+    if self:followsPlayer() and not self.player_on then
+        -- "Move the audio to this page" before a start: begin the follow of
+        -- the player, so the seek reaches it.
+        self.player_on = true
+        self:_syncClockToPlayer(now)
+    end
+    local position = cue.start + self.clock.offset
+    self:_seekTo(position, now)
     self:_manualSeek()
     self:_tick()
-    self:showNotification(T(_("Synced to %1"),
-        datetime.secondsToClock(cue.start + self.clock.offset, false)))
+    local clock_text = datetime.secondsToClock(position, false)
+    self:showNotification(self.player_on and T(_("Audio moved to %1"), clock_text)
+                                          or T(_("Synced to %1"), clock_text))
+end
+
+--- Text of the action that sets the place: it moves the audio when the
+--- follow reads the player, else the clock of the plugin.
+function SubRead:syncToPageText()
+    if self:followsPlayer() then
+        return _("Move the audio to this page")
+    end
+    return _("Sync the clock to this page")
+end
+
+--[[-- Dictionary lookup ]]--
+
+--- ReaderDictionary sends this before it looks a word up
+--- (readerdictionary.lua:1429). The player pauses while the user reads.
+function SubRead:onWordLookedUp()
+    if not self.player_on or self.lookup_paused then return end
+    local state = self:_readPlayer()
+    if not state or not state.playing then return end
+    self:_playerCall("pause")
+    self.clock:pause(self:_now())
+    self.lookup_paused = true
+    self.lookup_seen = false
+    self.lookup_waited = 0
+    -- An external dictionary is another app. KOReader gets a Resume event
+    -- when the user comes back (device/android/device.lua:179).
+    self.lookup_external = Device:canExternalDictLookup()
+        and G_reader_settings:isTrue("external_dict_lookup")
+    if not self.lookup_external then
+        UIManager:scheduleIn(LOOKUP_POLL, self.lookup_task)
+    end
+end
+
+--- Starts the player again when the last lookup window is closed.
+-- DictQuickLookup keeps its open windows in window_list
+-- (dictquicklookup.lua:176) and sends no event when the last one closes.
+function SubRead:_checkLookupDone()
+    if not self.lookup_paused then return end
+    local open = #DictQuickLookup.window_list > 0
+    if open then
+        self.lookup_seen = true
+    elseif not self.lookup_seen then
+        -- The lookup runs before the window opens. Wait for the window.
+        self.lookup_waited = self.lookup_waited + 1
+        if self.lookup_waited >= LOOKUP_WAIT_MAX then
+            self:_resumeAfterLookup()
+            return
+        end
+    end
+    if open or not self.lookup_seen then
+        UIManager:scheduleIn(LOOKUP_POLL, self.lookup_task)
+        return
+    end
+    self:_resumeAfterLookup()
+end
+
+function SubRead:_endLookupWait()
+    UIManager:unschedule(self.lookup_task)
+    self.lookup_paused = false
+end
+
+function SubRead:_resumeAfterLookup()
+    self:_endLookupWait()
+    if not self.player_on then return end
+    self:_playerCall("play")
+    self.clock:start(self:_now())
+    self:_tick()
+end
+
+function SubRead:onResume()
+    if self.lookup_paused and self.lookup_external then
+        self:_resumeAfterLookup()
+    end
 end
 
 --- Sets the clock from a piece of text that the user selected.
@@ -605,8 +897,16 @@ end
 function SubRead:statusText()
     local now = self:_now()
     local clock_text = datetime.secondsToClock(self.clock:getPosition(now), false)
-    local line = self.clock:isRunning() and T(_("Clock: %1, running"), clock_text)
-                                         or T(_("Clock: %1, paused"), clock_text)
+    local line
+    if self.player_on and self.player_status == "no_player" then
+        line = _("No audio player is open")
+    elseif self.player_on then
+        line = self.clock:isRunning() and T(_("Player: %1, playing"), clock_text)
+                                      or T(_("Player: %1, paused"), clock_text)
+    else
+        line = self.clock:isRunning() and T(_("Clock: %1, running"), clock_text)
+                                      or T(_("Clock: %1, paused"), clock_text)
+    end
     if self.cues and self.current_index then
         local cue = self.cues:get(self.current_index)
         if cue then
@@ -661,7 +961,7 @@ function SubRead:showControls()
                   end },
             },
             {
-                { text = _("Sync to this page"),
+                { text = self:syncToPageText(),
                   callback = again(function() self:syncToPage() end) },
                 { text = _("Go to time…"),
                   callback = function()
@@ -763,7 +1063,11 @@ function SubRead:onSubReadToggle()
     if not self:checkSupported() then return true end
     if not self:loadSubtitles() then return true end
     self:toggle()
-    self:showNotification(self.clock:isRunning() and _("Read-along running") or _("Read-along paused"))
+    if self.player_on then
+        self:showNotification(self.clock:isRunning() and _("Audio playing") or _("Audio paused"))
+    else
+        self:showNotification(self.clock:isRunning() and _("Read-along running") or _("Read-along paused"))
+    end
     return true
 end
 
@@ -783,79 +1087,102 @@ function SubRead:subtitleMenuText()
 end
 
 function SubRead:addToMainMenu(menu_items)
-    menu_items.subread = {
-        -- The key is not in reader_menu_order.lua, so MenuSorter puts the
-        -- entry where the hint says (menusorter.lua:161-182).
-        sorting_hint = "tools",
-        text = _("SubRead read-along"),
-        sub_item_table = {
-            {
-                text_func = function() return self:subtitleMenuText() end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    if self:checkSupported() then
-                        self:chooseSubtitleFile(touchmenu_instance)
+    local items = {
+        {
+            text_func = function() return self:subtitleMenuText() end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                if self:checkSupported() then
+                    self:chooseSubtitleFile(touchmenu_instance)
+                end
+            end,
+            hold_callback = function(touchmenu_instance)
+                self:setSubtitleFile(nil)
+                touchmenu_instance:updateItems()
+            end,
+            separator = true,
+        },
+        {
+            text_func = function()
+                return self:isActive() and _("Read-along controls")
+                                        or _("Start read-along")
+            end,
+            callback = function(touchmenu_instance)
+                touchmenu_instance:onClose()
+                if not self:checkSupported() then return end
+                if not self:isActive() then
+                    -- The controls would cover the line that the narrator reads.
+                    -- They open with the same menu entry when the user wants them.
+                    self:start()
+                    if self:isActive() then
+                        self:showNotification(_("Read-along started. The controls are in this menu."))
                     end
-                end,
-                hold_callback = function(touchmenu_instance)
-                    self:setSubtitleFile(nil)
-                    touchmenu_instance:updateItems()
-                end,
-                separator = true,
-            },
-            {
-                text_func = function()
-                    return self.clock:isRunning() and _("Read-along controls")
-                                                  or _("Start read-along")
-                end,
-                callback = function(touchmenu_instance)
-                    touchmenu_instance:onClose()
-                    if not self:checkSupported() then return end
-                    if not self.clock:isRunning() then
-                        -- The controls would cover the line that the narrator reads.
-                        -- They open with the same menu entry when the user wants them.
-                        self:start()
-                        if self.clock:isRunning() then
-                            self:showNotification(_("Read-along started. The controls are in this menu."))
-                        end
-                        return
-                    end
-                    self:showControls()
-                end,
-            },
-            {
-                text = _("Go to time…"),
-                keep_menu_open = true,
-                callback = function() self:showGoToTime() end,
-            },
-            {
-                text = _("What time is this page?"),
-                keep_menu_open = true,
-                callback = function() self:showPageTime() end,
-                separator = true,
-            },
-            {
-                text_func = function()
-                    return T(_("Player speed: %1"), string.format("%.2f", self.clock.speed))
-                end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self:showSpeed()
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-            },
-            {
-                text_func = function()
-                    return T(_("Audio offset: %1 s"), string.format("%+d", self.clock.offset))
-                end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self:showOffset()
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-            },
+                    return
+                end
+                self:showControls()
+            end,
+        },
+        {
+            text_func = function() return self:syncToPageText() end,
+            callback = function(touchmenu_instance)
+                touchmenu_instance:onClose()
+                self:syncToPage()
+            end,
+        },
+        {
+            text = _("Go to time…"),
+            keep_menu_open = true,
+            callback = function() self:showGoToTime() end,
+        },
+        {
+            text = _("What time is this page?"),
+            keep_menu_open = true,
+            callback = function() self:showPageTime() end,
+            separator = true,
         },
     }
+    if self.player then
+        table.insert(items, {
+            text = _("Follow the audio player"),
+            help_text = _("Reads the position of the audio player through the SubRead Overlay app, which needs notification access. Start, pause and the seeks then control the player. When off, the plugin runs its own clock."),
+            checked_func = function() return G_reader_settings:nilOrTrue(SETTING_FOLLOW_PLAYER) end,
+            callback = function()
+                G_reader_settings:flipNilOrTrue(SETTING_FOLLOW_PLAYER)
+                self:stop()
+            end,
+            separator = true,
+        })
+    end
+    menu_items.subread = {
+        -- placeInToolsMenu puts the id first in the Tools order. The hint is
+        -- for a user order file that does not list the id
+        -- (menusorter.lua:161-182).
+        sorting_hint = "tools",
+        text = _("SubRead read-along"),
+        sub_item_table = items,
+    }
+    table.insert(items, {
+        text_func = function()
+            return T(_("Player speed: %1"), string.format("%.2f", self.clock.speed))
+        end,
+        -- The player reports its speed, so the setting is for the own clock.
+        enabled_func = function() return not self:followsPlayer() end,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            self:showSpeed()
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    })
+    table.insert(items, {
+        text_func = function()
+            return T(_("Audio offset: %1 s"), string.format("%+d", self.clock.offset))
+        end,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            self:showOffset()
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    })
 end
 
 return SubRead
