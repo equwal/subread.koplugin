@@ -455,6 +455,8 @@ function SubRead:showCue(index)
     self.retry_from_index = 0
     self.last_xpointer = pos0
     self:drawCue(pos0, pos1)
+    -- Open controls show the clock and the cue of the time when they were built.
+    if self.controls_dialog then self:showControls() end
 end
 
 --- Turns the page if needed and draws the mark.
@@ -810,8 +812,13 @@ function SubRead:addToMainMenu(menu_items)
                     touchmenu_instance:onClose()
                     if not self:checkSupported() then return end
                     if not self.clock:isRunning() then
+                        -- The controls would cover the line that the narrator reads.
+                        -- They open with the same menu entry when the user wants them.
                         self:start()
-                        if not self.clock:isRunning() then return end
+                        if self.clock:isRunning() then
+                            self:showNotification(_("Read-along started. The controls are in this menu."))
+                        end
+                        return
                     end
                     self:showControls()
                 end,
