@@ -89,6 +89,7 @@ that is on.
 | Go to time… | Seeks to a position you type |
 | Speed | 0.5 to 3.0, for the own clock. The player reports its own speed. |
 | Offset | Seconds to add to the subtitle times. Use a positive value when the audio file starts with an intro that is not in the book. |
+| Mark | How the line is marked: Shade, Underline, Strikeout, Invert or None. Each tap sets the next one. |
 | What time is this page? | Shows the time of the first cue on the page |
 
 Select text in the book and use **SubRead: sync here** to move the audio, or
@@ -108,17 +109,18 @@ The plugin adds three actions to the gesture manager and the key bindings:
 
 The plugin does not read the whole book for every cue. It takes the first few
 words of the cue and searches forward from the page you are on, the same
-search that KOReader's own full text search uses. A hit before the last found
-place is dropped, so the follow can only move forward. Found places are kept
-for the session.
+search that KOReader's own full text search uses. A hit before the nearest cue
+already found is dropped, and so is a hit many pages after it: the same words
+at another place of the book must not pull the follow away. Found places are
+kept for the session.
 
-When a cue is not found, the plugin keeps the last place and waits a few cues
-before it searches again. The wait doubles with each miss. This keeps the cost
+When a cue is not found after the page you are on, the plugin reads the
+whole book once, with the place of the nearest cue it already found as the
+lower limit. This is what happens after a jump in the audio, or after you
+turned pages away from the narration. When the cue is not in the book at
+all, the plugin keeps the last place and waits a few cues before it searches
+again. The wait doubles with each miss, up to four cues. This keeps the cost
 low when a stretch of the book is missing from the subtitle file.
-
-After a jump that you asked for, the place can be behind the page you are on.
-The plugin then reads the whole book once, and uses the place of the nearest
-cue it already found as the lower limit.
 
 A cue whose text starts with `＊` has no place in the book. The plugin leaves
 the view alone for such a cue.
