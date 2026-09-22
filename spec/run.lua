@@ -38,7 +38,7 @@ function _G.it(name, body)
 end
 _G.setup, _G.teardown, _G.before_each, _G.after_each = function(f) f() end, function() end, nil, nil
 
-for _, name in ipairs({ "text", "srt", "cues", "clock", "player_state" }) do
+for _, name in ipairs({ "text", "srt", "cues", "clock", "player_state", "languages" }) do
     dofile(here .. name .. "_spec.lua")
 end
 print(string.format("%d passed, %d failed", passed, failed))
