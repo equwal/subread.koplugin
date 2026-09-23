@@ -8,6 +8,9 @@ with the audio player and keeps the place of the narration on the screen.
 Only crengine documents (EPUB, FB2, TXT, HTML) are supported. PDF and DjVu
 have no xpointer, so the place cannot be followed.
 
+On Android the plugin reads the audio player through SubRead Overlay, an app
+with notification access. See subread/android_player.lua.
+
 @module koplugin.SubRead
 --]]--
 
@@ -61,7 +64,7 @@ local MIN_SLEEP = 0.05
 -- After a cue is not found, the plugin waits this many cues before it
 -- searches again. The wait doubles with each miss. A failed search reads the
 -- book to its end, so this limits the cost when the book misses a stretch.
-local MISS_BACKOFF_MAX = 16
+local MISS_BACKOFF_MAX = 4
 
 -- Seconds between two reads of the audio player. The player reports its
 -- position and speed, so the clock is exact between two reads. A read only
@@ -90,6 +93,17 @@ local SETTING_SPEED = "subread_speed"
 local SETTING_OFFSET = "subread_offset"
 -- Global setting: follow the audio player through SubRead Overlay.
 local SETTING_FOLLOW_PLAYER = "subread_follow_player"
+-- Global setting: how the mark is drawn. The names are the highlight
+-- drawers of ReaderView:drawHighlightRect (readerview.lua:659), plus none.
+local SETTING_MARK_STYLE = "subread_mark_style"
+local MARK_STYLES = { "lighten", "underscore", "strikeout", "invert", "none" }
+local MARK_STYLE_NAMES = {
+    lighten = _("Shade"),
+    underscore = _("Underline"),
+    strikeout = _("Strikeout"),
+    invert = _("Invert"),
+    none = _("None"),
+}
 
 local SubRead = WidgetContainer:extend{
     name = "subread",
@@ -102,7 +116,6 @@ function SubRead:init()
     self.srt_path = nil
     self.current_index = nil   -- cue shown now
     self.located = {}          -- cue index -> { start xpointer, end xpointer }
-    self.last_xpointer = nil   -- place of the last found cue
     self.miss_streak = 0
     self.retry_from_index = 0
     self.manual_seek = false
@@ -128,11 +141,16 @@ function SubRead:init()
     self.lookup_task = function() self:_checkLookupDone() end
     self.skip_player_read = false
 
+    self.mark = nil             -- { start xpointer, end xpointer } of the cue on screen
+
     self:placeInToolsMenu()
     self.ui.menu:registerToMainMenu(self)
     if self:isSupported() then
         self:registerDispatcherActions()
         self:addToHighlightDialog()
+        -- ReaderView calls paintTo of each view module after the page
+        -- (readerview.lua:257). The mark is drawn there.
+        self.view:registerViewModule("subread", self)
     end
 end
 
@@ -279,7 +297,6 @@ function SubRead:setSubtitleFile(path)
     self.cues = nil
     self.located = {}
     self.current_index = nil
-    self.last_xpointer = nil
     self:saveState()
 end
 
@@ -408,9 +425,6 @@ function SubRead:start()
     if self.player_status ~= "no_player" then
         self.clock:start(now)
     end
-    -- The reader may have moved the view since the last pause, so drop the
-    -- lower limit and let the search start at the page that is shown.
-    self.last_xpointer = nil
     self.miss_streak = 0
     self.retry_from_index = 0
     self.current_index = nil -- force a redraw of the cue that is on
@@ -438,8 +452,9 @@ function SubRead:stop()
     self.player_on = false
     self.player_status = nil
     self:_unschedule()
-    if self:isSupported() and self.ui.document then
-        self.ui.document:clearSelection()
+    if self.mark then
+        self.mark = nil
+        UIManager:setDirty(self.view.dialog, "ui")
     end
     self:saveState()
 end
@@ -504,17 +519,26 @@ function SubRead:_tick()
     self.scheduled = false
     if not self.cues then return end
     local now = self:_now()
+    -- An error in the step must not end the loop: the next tick is always
+    -- scheduled.
+    local ok, err = pcall(self._follow, self, now)
+    if not ok then
+        logger.err("SubRead: follow step failed:", err)
+    end
+    self:_schedule(now, self.clock:getCueTime(now))
+end
+
+--- Reads the player, then shows the cue of the clock time.
+function SubRead:_follow(now)
     if self.player_on and not self.skip_player_read then
         self:_syncClockToPlayer(now)
     end
     self.skip_player_read = false
-    local cue_time = self.clock:getCueTime(now)
-    local index = self.cues:findByTime(cue_time)
+    local index = self.cues:findByTime(self.clock:getCueTime(now))
     if index and index ~= self.current_index then
         self.current_index = index
         self:showCue(index)
     end
-    self:_schedule(now, cue_time)
 end
 
 --- Sleeps until the next cue starts, or the next read of the player, or
@@ -550,22 +574,43 @@ end
 -- How many cues back to look for a place that is already known.
 local FLOOR_LOOKBACK = 50
 
---- Returns the place of the nearest cue before index that is already found.
+--- Returns the place of the nearest cue before index that is already found,
+--- and how many cues back it is.
 function SubRead:_floorFor(index)
     local first = index - FLOOR_LOOKBACK
     if first < 1 then first = 1 end
     for at = index - 1, first, -1 do
         local found = self.located[at]
-        if found then return found[1] end
+        if found then return found[1], index - at end
     end
-    return nil
+    return nil, 0
+end
+
+-- A hit may lie this many pages after the nearest cue already found, plus
+-- one page for each NEAR_CUES_PER_PAGE cues between the two. A cue is about
+-- one line, so a hit further away is the same words at another place.
+local NEAR_PAGES = 2
+local NEAR_CUES_PER_PAGE = 8
+-- After this many misses in a row the page limit is dropped: the subtitle
+-- file may skip a long part of the book.
+local NEAR_GIVE_UP = 2
+
+--- True when the hit is not too many pages after the floor.
+function SubRead:_isNear(floor_xpointer, cue_gap, xpointer)
+    if not floor_xpointer then return true end
+    local document = self.ui.document
+    local from = document:getPageFromXPointer(floor_xpointer)
+    local to = document:getPageFromXPointer(xpointer)
+    if not from or not to then return true end
+    return to - from <= NEAR_PAGES + math.ceil(cue_gap / NEAR_CUES_PER_PAGE)
 end
 
 --- Finds the place of a cue in the book.
 -- The search starts at the current page and runs forward, so the plugin never
--- reads the whole book for every cue. Hits before the last found place are
--- dropped, so a word that comes again on the same page cannot pull the
--- follow backward.
+-- reads the whole book for every cue. A hit before the nearest cue already
+-- found is dropped, so a word that comes again on the same page cannot pull
+-- the follow backward. A hit many pages after it is dropped too, so the same
+-- words at another place of the book cannot pull the follow forward.
 -- @return start xpointer, end xpointer, or nil
 function SubRead:_locate(index)
     local cached = self.located[index]
@@ -576,14 +621,35 @@ function SubRead:_locate(index)
     local cue = self.cues:get(index)
     if not cue or cue.no_place then return nil end
 
-    local origin, floor = SEARCH_FROM_CURRENT_PAGE, self.last_xpointer
-    if self.manual_seek then
-        self.manual_seek = false
-        origin, floor = SEARCH_WHOLE_BOOK, self:_floorFor(index)
+    local anchors = Text.anchors(cue.norm)
+    local floor, gap = self:_floorFor(index)
+    local pos0, pos1
+    if not self.manual_seek then
+        pos0, pos1 = self:_search(cue, anchors, SEARCH_FROM_CURRENT_PAGE, floor, gap)
     end
+    if not pos0 then
+        -- The cue is not after the current page: the user turned pages, or
+        -- the player went back. Read the whole book once, from the nearest
+        -- cue that is already found.
+        self.manual_seek = false
+        pos0, pos1 = self:_search(cue, anchors, SEARCH_WHOLE_BOOK, floor, gap)
+    end
+    if not pos0 and floor and self.miss_streak >= NEAR_GIVE_UP then
+        -- Nothing near the floor for a while: the book may skip a part, or
+        -- the floor itself is wrong. Take the first hit in the book.
+        pos0, pos1 = self:_search(cue, anchors, SEARCH_WHOLE_BOOK, nil, 0)
+    end
+    if pos0 then
+        self.located[index] = { pos0, pos1 }
+    end
+    return pos0, pos1
+end
 
+--- Searches the anchors of a cue. Returns the first hit at or after floor
+--- that is near it.
+function SubRead:_search(cue, anchors, origin, floor, gap)
     local document = self.ui.document
-    for _, anchor in ipairs(Text.anchors(cue.norm)) do
+    for _, anchor in ipairs(anchors) do
         -- findText(pattern, origin, direction, case_insensitive, page, regex,
         -- max_hits, search_flags) (credocument.lua:1442). Each hit holds the
         -- xpointers "start" and "end" (readersearch.lua:446-447).
@@ -591,12 +657,12 @@ function SubRead:_locate(index)
             true, self.view.state.page, false, SEARCH_MAX_HITS, SEARCH_FLAGS)
         if hits then
             for _, hit in ipairs(hits) do
-                if hit.start and self:_isAtOrAfter(floor, hit.start) then
+                if hit.start and self:_isAtOrAfter(floor, hit.start)
+                    and self:_isNear(floor, gap, hit.start) then
                     local pos1 = hit["end"]
                     if Text.len(anchor) < Text.len(cue.norm) then
-                        pos1 = self:_cueEnd(cue, hit.start, pos1)
+                        pos1 = self:_cueEnd(cue, hit.start, pos1, origin)
                     end
-                    self.located[index] = { hit.start, pos1 }
                     return hit.start, pos1
                 end
             end
@@ -615,11 +681,11 @@ local CUE_END_SLACK = 2
 -- searched forward from the current page, and the first hit after the start
 -- that lies close to it gives the end. When the tail is not found, the end
 -- of the anchor stays.
-function SubRead:_cueEnd(cue, pos0, anchor_end)
+function SubRead:_cueEnd(cue, pos0, anchor_end, origin)
     local tail = Text.tail(cue.norm)
     if not tail then return anchor_end end
     local document = self.ui.document
-    local hits = document:findText(tail, SEARCH_FROM_CURRENT_PAGE, SEARCH_FORWARD,
+    local hits = document:findText(tail, origin, SEARCH_FORWARD,
         true, self.view.state.page, false, SEARCH_MAX_HITS, SEARCH_FLAGS)
     if not hits then return anchor_end end
     local limit = Text.len(cue.norm) * CUE_END_SLACK + Text.TAIL_LENGTH
@@ -654,36 +720,59 @@ function SubRead:showCue(index)
     end
     self.miss_streak = 0
     self.retry_from_index = 0
-    self.last_xpointer = pos0
     self:drawCue(pos0, pos1)
     -- Open controls show the clock and the cue of the time when they were built.
     if self.controls_dialog then self:showControls() end
 end
 
---- Turns the page if needed and draws the mark.
--- The mark is the crengine selection, the same one that KOReader draws for a
--- full text search hit (readersearch.lua:946). crengine draws it itself, so
--- it costs no extra widget, it survives a page turn, and it is never written
--- into the book's annotations.
+--- Turns the page if needed and asks for a redraw with the mark.
 function SubRead:drawCue(pos0, pos1)
     local document = self.ui.document
     local was_visible = document:isXPointerInCurrentPage(pos0)
     if not was_visible then
         self.ui.rolling:onGotoXPointer(pos0)
     end
-    if pos1 then
-        document:getTextFromXPointers(pos0, pos1, true)
-    end
+    self.mark = pos1 and { pos0, pos1 } or nil
     -- A page turn needs a partial refresh. A mark that moves inside the same
     -- page only needs the light "ui" refresh.
     UIManager:setDirty(self.view.dialog, was_visible and "ui" or "partial")
 end
 
---- Draws the cue that is on again, after something else used the selection.
-function SubRead:redrawCurrentCue()
-    if not self.current_index then return end
-    local pos0, pos1 = self:_locate(self.current_index)
-    if pos0 then self:drawCue(pos0, pos1) end
+--- Draws the mark over the page. ReaderView calls this after each paint of
+--- the page, so the mark survives a page turn and is never written into the
+--- annotations of the book. The boxes are the line segments of the cue on
+--- the screen, the same ones that ReaderHighlight draws for a highlight.
+--- crengine's own selection is not used: in vertical text it draws one line
+--- of a range only.
+function SubRead:paintTo(bb, x, y)
+    if not self.mark then return end
+    local style = self:markStyle()
+    if style == "none" then return end
+    local boxes = self.ui.document:getScreenBoxesFromPositions(self.mark[1], self.mark[2], true)
+    if not boxes then return end
+    for _, box in ipairs(boxes) do
+        -- The same drawing as a highlight. The boxes are in screen
+        -- coordinates. No color: the gray of the highlight setting.
+        self.view:drawHighlightRect(bb, x, y, box, style, nil)
+    end
+end
+
+function SubRead:markStyle()
+    local style = G_reader_settings:readSetting(SETTING_MARK_STYLE)
+    if not MARK_STYLE_NAMES[style] then style = MARK_STYLES[1] end
+    return style
+end
+
+--- Sets the next style of the list and redraws the page.
+function SubRead:cycleMarkStyle()
+    local current = self:markStyle()
+    for at, style in ipairs(MARK_STYLES) do
+        if style == current then
+            G_reader_settings:saveSetting(SETTING_MARK_STYLE, MARK_STYLES[at % #MARK_STYLES + 1])
+            break
+        end
+    end
+    UIManager:setDirty(self.view.dialog, "ui")
 end
 
 --[[-- Page and time ]]--
@@ -706,11 +795,7 @@ function SubRead:cueIndexForCurrentPage()
     if not self.cues then return nil end
     local page_text = self:currentPageText()
     if not page_text or page_text == "" then return nil end
-    local index = self.cues:findIndexForText(page_text)
-    -- getTextFromXPointers with draw_selection false can drop the mark, so
-    -- put it back.
-    if self.clock:isRunning() then self:redrawCurrentCue() end
-    return index
+    return self.cues:findIndexForText(page_text)
 end
 
 function SubRead:showPageTime()
@@ -973,6 +1058,8 @@ function SubRead:showControls()
                   end },
             },
             {
+                { text = T(_("Mark: %1"), MARK_STYLE_NAMES[self:markStyle()]),
+                  callback = again(function() self:cycleMarkStyle() end) },
                 { text = _("What time is this page?"),
                   callback = again(function() self:showPageTime() end) },
             },

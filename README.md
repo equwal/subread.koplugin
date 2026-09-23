@@ -40,33 +40,60 @@ If the file is somewhere else, open **Tools → SubRead read-along** and tap the
 first line to select it with the file browser. The plugin remembers the choice
 for that book.
 
-## Use it
+## Use it on Android, with the audio player
+
+On Android the plugin reads the position of the audio player, so the book
+follows the audio exactly. KOReader has no notification access, so it cannot
+see the player itself. The [SubRead Overlay](https://github.com/equwal/subread-overlay)
+app has that access and answers for KOReader.
+
+1. Install SubRead Overlay and give it notification access. Its panel does
+   not need to be on the screen.
+2. Start the audiobook in your audio player (Voice, VLC, Smart AudioBook
+   Player, or any player with a media session).
+3. In KOReader, open **Tools → SubRead read-along → Start read-along**.
+4. The plugin reads the player every two seconds and turns the pages with it.
+   Start, Pause, the seeks and **Move the audio to this page** control the
+   player.
+
+A dictionary lookup pauses the player. It plays again when you close the
+lookup window, or when you come back from an external dictionary app.
+
+**Follow the audio player** in the menu turns this off. The plugin then runs
+its own clock, as below.
+
+## Use it with the own clock
+
+Without SubRead Overlay, or on a device that is not Android, the plugin runs
+a clock beside your player.
 
 1. Start the audiobook in your audio player.
 2. In KOReader, open **Tools → SubRead read-along → Start read-along**.
 3. The clock starts at the time of the first cue on the page you are reading,
    or at the position you had last time.
-4. Use **Sync to this page**, or select the words the narrator is reading and
-   choose **SubRead: sync here**, to set the clock exactly.
+4. Use **Sync the clock to this page**, or select the words the narrator is
+   reading and choose **SubRead: sync here**, to set the clock exactly.
 
 ### Controls
 
-The controls dialog shows the clock, whether it runs, and the cue that is on.
+The controls dialog shows the position, whether the audio plays, and the cue
+that is on.
 
 | Control | What it does |
 |---|---|
 | Prev. cue / Next cue | Back or forward one cue |
 | `-10 s` / `+10 s` | Back or forward ten seconds |
-| Start / Pause | Starts or stops the clock |
-| Stop | Stops the clock and takes the mark off |
-| Sync to this page | Sets the clock to the first cue on the page |
-| Go to time… | Sets the clock to a position you type |
-| Speed | 0.5 to 3.0, for a player that runs fast |
+| Start / Pause | Starts or stops the player, or the own clock |
+| Stop | Stops the follow and takes the mark off |
+| Move the audio to this page | Seeks the player to the first cue on the page. With the own clock: sets the clock there. |
+| Go to time… | Seeks to a position you type |
+| Speed | 0.5 to 3.0, for the own clock. The player reports its own speed. |
 | Offset | Seconds to add to the subtitle times. Use a positive value when the audio file starts with an intro that is not in the book. |
-| What time is this page? | Shows the time of the first cue on the page, so you can seek your audio player there |
+| Mark | How the line is marked: Shade, Underline, Strikeout, Invert or None. Each tap sets the next one. |
+| What time is this page? | Shows the time of the first cue on the page |
 
-Select text in the book and use **SubRead: sync here** to set the clock to the
-cue that holds those words.
+Select text in the book and use **SubRead: sync here** to move the audio, or
+the clock, to the cue that holds those words.
 
 The clock position, the speed and the offset are kept for each book.
 
@@ -82,17 +109,18 @@ The plugin adds three actions to the gesture manager and the key bindings:
 
 The plugin does not read the whole book for every cue. It takes the first few
 words of the cue and searches forward from the page you are on, the same
-search that KOReader's own full text search uses. A hit before the last found
-place is dropped, so the follow can only move forward. Found places are kept
-for the session.
+search that KOReader's own full text search uses. A hit before the nearest cue
+already found is dropped, and so is a hit many pages after it: the same words
+at another place of the book must not pull the follow away. Found places are
+kept for the session.
 
-When a cue is not found, the plugin keeps the last place and waits a few cues
-before it searches again. The wait doubles with each miss. This keeps the cost
+When a cue is not found after the page you are on, the plugin reads the
+whole book once, with the place of the nearest cue it already found as the
+lower limit. This is what happens after a jump in the audio, or after you
+turned pages away from the narration. When the cue is not in the book at
+all, the plugin keeps the last place and waits a few cues before it searches
+again. The wait doubles with each miss, up to four cues. This keeps the cost
 low when a stretch of the book is missing from the subtitle file.
-
-After a jump that you asked for, the place can be behind the page you are on.
-The plugin then reads the whole book once, and uses the place of the nearest
-cue it already found as the lower limit.
 
 A cue whose text starts with `＊` has no place in the book. The plugin leaves
 the view alone for such a cue.
@@ -103,9 +131,9 @@ The screen is only redrawn when the cue changes. A timer tick on its own never
 redraws anything. A mark that moves inside the same page uses the light `ui`
 refresh. A page turn uses the `partial` refresh.
 
-The mark is the same selection that KOReader draws for a full text search hit.
-crengine draws it, so it costs no extra widget and it is never written into
-your highlights.
+The mark is drawn over the page with the same line boxes and the same shade
+that KOReader uses for a highlight. It is never written into your
+highlights.
 
 ## Limits
 
@@ -118,7 +146,8 @@ your highlights.
   that does not match is skipped and the last place stays.
 * "What time is this page?" needs a next page, so it does not work on the last
   page of the book.
-* The plugin cannot control your audio player. It only follows the clock.
+* Without SubRead Overlay the plugin cannot see or control your audio player.
+  It only follows its own clock.
 
 ## Tests
 
