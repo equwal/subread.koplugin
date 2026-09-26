@@ -34,6 +34,7 @@ local T = require("ffi/util").template
 
 local Clock = require("subread.clock")
 local Cues = require("subread.cues")
+local MoreApps = require("subread.more_apps")
 local PlayerState = require("subread.player_state")
 local Srt = require("subread.srt")
 local Text = require("subread.text")
@@ -970,6 +971,17 @@ function SubRead:showNotification(text)
     UIManager:show(Notification:new{ text = text, timeout = 2 })
 end
 
+--- Shows the other apps of the author. The list is long, so a TextViewer
+--- shows it. KOReader cannot open a web browser on each device, so the
+--- addresses are text.
+function SubRead:showMoreApps()
+    local TextViewer = require("ui/widget/textviewer")
+    UIManager:show(TextViewer:new{
+        title = _("More apps"),
+        text = MoreApps.text(),
+    })
+end
+
 function SubRead:statusText()
     local now = self:_now()
     local clock_text = datetime.secondsToClock(self.clock:getPosition(now), false)
@@ -1260,6 +1272,12 @@ function SubRead:addToMainMenu(menu_items)
             self:showOffset()
             if touchmenu_instance then touchmenu_instance:updateItems() end
         end,
+        separator = true,
+    })
+    table.insert(items, {
+        text = _("More apps"),
+        keep_menu_open = true,
+        callback = function() self:showMoreApps() end,
     })
 end
 
